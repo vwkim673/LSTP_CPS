@@ -1,8 +1,8 @@
-# C++ programming example for Visionary-T cameras
+# C++ programming example for Visionary-T Mini cameras
 
 ## Table of contents
 
-- [C++ programming example for Visionary-T cameras](#c-programming-example-for-visionary-t-cameras)
+- [C++ programming example for Visionary-T Mini cameras](#c-programming-example-for-visionary-t-mini-cameras)
     - [Table of contents](#table-of-contents)
     - [Requirements](#requirements)
     - [Quickstart](#quickstart)
@@ -24,18 +24,18 @@
 
 ## Requirements
 Make sure you have already built the project files like described in the file `README.pdf` on the top level folder `sick_visionary_cpp_samples`.
-Then the sample contains a Visual Studio Solution file as well as a CMakeLists file. To open and compile it with Microsoft Visual Studio at least Version of 2015 is needed. For platform independent compiling the CMakeLists is available, which needs at least CMake 2.8 with support for C++11.
+After the successful build of `cmake ..`, the `build` folder contains a Visual Studio Solution file `SampleVisionaryTMini.sln` as well as a CMakeLists file. To open and compile it with Microsoft Visual Studio at least Version of 2015 is needed. For platform independent compiling the CMakeLists is available, which needs at least CMake 2.8 with support for C++11.
 
 ## Quickstart
 ### Using Visual studio
-1. Open the SampleVisionaryT.sln file with Visual Studio
-2. Set The SampleVisionaryT for your device type as StartUp project
-3. Start the debugger and the sample will automatically connect to a Visionary-T camera with default IP (`192.168.1.10`) and default API-Port (`2114`). To change them modify the function call to `runStreamingDemo` in the main function or call the executable with the corrosponding parameters (Start with -h to see all possibilities).
+1. Open the SampleVisionaryTMini.sln file with Visual Studio
+2. Set The SampleVisionaryTMini for your device type as StartUp project
+3. Start the debugger and the sample will automatically connect to a Visionary-T Mini camera with default IP (`192.168.1.10`) and default API-Port (`2114`). To change them modify the function call to `runStreamingDemo` in the main function or call the executable with the corrosponding parameters (Start with -h to see all possibilities).
 
 ### Using CMake
 1. Run CMake on the CMakeLists file.
 2. This should end with an executable for your platform.
-3. Start the debugger and the sample will automatically connect to a Visionary-T camera with default IP (`192.168.1.10`) and default API-Port (`2114`). To change them modify the function call to `runStreamingDemo` in the main function or call the executable with the corrosponding parameters (Start with -h to see all possibilities).
+3. Start the debugger and the sample will automatically connect to a Visionary-T Mini camera with default IP (`192.168.1.10`) and default API-Port (`2114`). To change them modify the function call to `runStreamingDemo` in the main function or call the executable with the corrosponding parameters (Start with -h to see all possibilities).
 
 ## Code examples
 This section covers the different parts of the sample in more detail and how to adjust them to work for your own applications.
@@ -56,15 +56,15 @@ VisionaryDataStream dataStream(pDataHandler);
 VisionaryControl visionaryControl;
 ```
 
-The next step is to open both the data stream and control connections. Both of them return a `bool` specifying if the connection was successful or not. The `ipAddress` (default `192.168.1.10`), control protocol type (CoLa B) and `dataPort` (default `2114`) variables specifies which device to connect to:
+The next step is to open both the data stream and control connections. Both of them return a `bool` specifying if the connection was successful or not. The `ipAddress` (default `192.168.1.10`), control protocol type (CoLa 2) and `dataPort` (default `2114`) variables specifies which device to connect to:
 ```c++
 if (!dataStream.open(ipAddress, htons(dataPort)))
 {
     // Data stream connection failed
 }
-if (!visionaryControl.open(VisionaryControl::ProtocolType::COLA_B, ipAddress, 5000/*ms*/))
+if (!visionaryControl.open(VisionaryControl::ProtocolType::COLA_2, ipAddress, 5000/*ms*/))
 {
-    // Device control (CoLaB) connection failed
+    // Device control (CoLa 2) connection failed
 }
 ```
 
@@ -101,12 +101,6 @@ if (dataStream.getNextFrame())
     uint64_t timestamp = pDataHandler->getTimestampMS();                            // Frame timestamp in milliseconds 
     const std::vector<uint16_t> distanceMap = pDataHandler->getDistanceMap();       // Distance values
     const std::vector<uint16_t> intensityMap = pDataHandler->getIntensityMap();     // Intensity values
-    const std::vector<uint16_t> confidenceMap = pDataHandler->getConfidenceMap();   // Confidence values
-    // For AG devices also polar or cartesian data can be get if enabled
-    std::vector<float> scanPoints = pDataHandler->getPolarDistanceData();           // Polar scan points
-    std::vector<PointXYZC> cartesian = pDataHandler->getCartesianData();            // Cartesian values as points with X, Y, Z and confidence
-    // For DT devices the detection results can be get if enabled
-    std::vector<PointXYZC> cartesian = pDataHandler->getCartesianData();            // Detection values as points with position in X and Y and detection result
 }
 ```
 
@@ -159,49 +153,49 @@ The method supports writing both ASCII and Binary PLY files, and is controlled b
 The intensity values parameter can be omitted if your application doesn't need them.
 
 ### Device configuration
-It is also possible to both read and write the device configuration variables using C++. This is done by sending and receiving CoLa B commands to and from the device. When reading or writing variables, or invoking a device method the general approach is:
+It is also possible to both read and write the device configuration variables using C++. This is done by sending and receiving CoLa 2 commands to and from the device. When reading or writing variables, or invoking a device method the general approach is:
 
-1. Create a CoLa B command
+1. Create a CoLa 2 command
 2. Send the created command to the device
 3. Receive the response command from the device
 4. Parse the response command
 
-A CoLa B command is made up of a `type`, a `name`, and any number of parameters. The name and which parameters to use for a specific command is specified in the *CID Visionary ... pdf* (CID stands for *SOPAS Communication Interface Description*) document.
+A CoLa 2 command is made up of a `type`, a `name`, and any number of parameters. The name and which parameters to use for a specific command is specified in the *CID Visionary ... pdf* (CID stands for *SOPAS Communication Interface Description*) document.
 
 #### Reading a variable
-The goal in this example is to read the `integrationTimeUs` variable  from the device. The first step is to find the variable in the *CID Visionary ... pdf* document, and go to the *Variable Telegram Syntax* part, for `integrationTimeUs` the first table (*Read Variable:*) looks like this:
-![](docs/readIntegrationTimeUs.png)
+The goal in this example is to read the `humidity` variable  from the device. The first step is to find the variable in the *CID Visionary ... pdf* document, and go to the *Variable Telegram Syntax* part, for `humidity` the first table (*Read Variable:*) looks like this:  
+![](docs/humidity.png)
 
-This specifies that to read the variable a CoLa B command must be constructed with the name `integrationTimeUs` (**_Note:_** this might not always match the variable name!) and no additional parameters.
+This specifies that to read the variable a CoLa B command must be constructed with the name `humidity` (**_Note:_** this might not always match the variable name!) and no additional parameters.
 
 The easiest way to create such a command is to use the `CoLaParameterWriter`:
 ```c++
 #include "CoLaParameterWriter.h"
 [...]
-CoLaCommand getIntegrationTimeCommand = CoLaParameterWriter(CoLaCommandType::READ_VARIABLE, "integrationTimeUs").build();
+CoLaCommand getHumidity = CoLaParameterWriter(CoLaCommandType::READ_VARIABLE, "humidity").build();
 ```
 
 The next step is to send the command to the device, and receive the response:
 ```c++
-CoLaCommand integrationTimeResponse = visionaryControl.sendCommand(getIntegrationTimeCommand);
+CoLaCommand humidityResponse = visionaryControl.sendCommand(getHumidity);
 ```
 
-To be able to parse the response command it is again required to consult the *CID Visionary ... pdf* document to see what the response contains. This time look for the table *Read Variable Response:*, which for the `integrationTimeUs` variable looks like this:
-![](docs/readResponseIntegrationTime.png)
+To be able to parse the response command it is again required to consult the *CID Visionary ... pdf* document to see what the response contains. This time look for the table *Read Variable Response:*, which for the `humidity` variable looks like this:  
+![](docs/readResponsehumidity.png)
 
-The important part from this table is the *Variable Data* entry which specifies that the response contains a single value of type `UDInt` (Unsigned Double Integer). This knowledge can then be used together with a `CoLaParameterReader` to read the actual value.
+The important part from this table is the *Variable Data* entry which specifies that the response contains a single value of type `LReal` (Long Reak). This knowledge can then be used together with a `CoLaParameterReader` to read the actual value.
 
 ```c++
 #include "CoLaParameterReader.h"
 [...]
-uint32_t integrationTimeUs = CoLaParameterReader(integrationTimeResponse).readUDInt();
+const double humidity = CoLaParameterReader(humidityResponse).readLReal();
 ```
 
 #### Authorization
-Most variables can be read without any specific permission, but writing them often requires a login to be performed first. In the *CID Visionary ... pdf* document the required access level for variables are specified in the "Variable Overview" table, and for the `integrationTimeUs` variable looks like this:
-![](docs/accessIntegrationTime.png)
+Most variables can be read without any specific permission, but writing them often requires a login to be performed first. In the *CID Visionary ... pdf* document the required access level for variables are specified in the "Variable Overview" table, and for the `enDepthMask` variable looks like this:  
+![](docs/accessEnDepthMask.png)
 
-Before writing to a variable one of the specified *Write-Access* levels must be set, this can be done using CoLa B commands as well, but the control object has a convenience method for this, the first parameter is the requested access level, and the second parameter is the password for that level: 
+Before writing to a variable one of the specified *Write-Access* levels must be set, this can be done using CoLa 2 commands as well, but the control object has a convenience method for this, the first parameter is the requested access level, and the second parameter is the password for that level: 
 ```c++
 if (visionaryControl.login(IAuthentication::UserLevel::AUTHORIZED_CLIENT, "CLIENT"))
 {
@@ -218,24 +212,24 @@ if (!visionaryControl.logout())
 ```
 
 #### Writing a variable
-The steps to write a variable are very similar to reading a variable. The first step is to find the *Write Variable:* table for the variable, in this case for `integrationTimeUs`:
-![](docs/writeIntegrationTime.png)
+The steps to write a variable are very similar to reading a variable. The first step is to find the *Write Variable:* table for the variable, in this case for `enDepthMask`:  
+![](docs/writeenDepthMask.png)
 
-As expected, the *Variable Data* parameter here is also a `UDInt`. Again the `CoLaParameterWriter` is used to construct the command to send to the device:
+As expected, the *Variable Data* parameter here is a `bool`. Again the `CoLaParameterWriter` is used to construct the command to send to the device:
 ```c++
-CoLaCommand setIngrationTimeCommand = CoLaParameterWriter(CoLaCommandType::WRITE_VARIABLE, "integrationTimeUs").parameterUDInt(3800).build();
+CoLaCommand setEnDepthMaskCommand = CoLaParameterWriter(CoLaCommandType::WRITE_VARIABLE, "enDepthMask").parameterBool(false).build();
+CoLaCommand setEnDepthMaskResponse = visionaryControl.sendCommand(setEnDepthMaskCommand);
 ```
 
-Compared to reading the variable the type is now set to `WRITE_VARIABLE`, and a `UDInt` parameter is also appended. Because writing a variable doesn't return anything there is no need to parse the result, but it is recommended to check for errors (see next section).
-
+Compared to reading the variable the type is now set to `WRITE_VARIABLE`, and a `bool` parameter is also appended. Because writing a variable doesn't return anything there is no need to parse the result, but it is recommended to check for errors (see next section).
 
 #### Error handling
 When reading and writing variables in a real application it is recommended to check the response for errors:
 ```c++
 #include "CoLaError.h"
 [...]
-CoLaCommand setIngrationTimeResponse = visionaryControl.sendCommand(setIngrationTimeCommand);
-if (getIntegrationTimeResponse.getError() == CoLaError::OK)
+CoLaCommand setEnDepthMaskResponse = visionaryControl.sendCommand(setEnDepthMaskCommand);
+if (setEnDepthMaskResponse.getError() == CoLaError::OK)
 {
     // Command was successful
 }
@@ -246,7 +240,7 @@ else
 ```
 
 #### Reading struct and array variables
-So far the variable has only had a single value but variables can actually contain either a struct of multiple values, an array of values, or even an array of structs. This example will show how to read the variable `EMsgInfo` which contains all info log messasges in the device. Again the first step is to look up the variable definition, this is the *Variable Overview*:
+So far the variable has only had a single value but variables can actually contain either a struct of multiple values, an array of values, or even an array of structs. This example will show how to read the variable `EMsgInfo` which contains all info log messasges in the device. Again the first step is to look up the variable definition, this is the *Variable Overview*:  
 ![](docs/overviewEMsgInfo.png)
 
 There are a few important things to notice here:
@@ -262,10 +256,10 @@ CoLaCommand getMessagesCommand = CoLaParameterWriter(CoLaCommandType::READ_VARIA
 CoLaCommand messagesResponse = visionaryControl.sendCommand(getMessagesCommand);
 ```
 
-The next step is to parse the response. For this it is required to lookup the `ErrStructType` definition in the *CID Visionary ... pdf* document, which looks like this:
+The next step is to parse the response. For this it is required to lookup the `ErrStructType` definition in the *CID Visionary ... pdf* document, which looks like this:  
 ![](docs/definitionErrStructType.png)
 
-As seen above this struct contains seven different values with different types. Also notices that the `FirstTime` and `LastTime` members are of type `ErrTimeType`, this struct can also be found in the document:
+As seen above this struct contains seven different values with different types. Also notices that the `FirstTime` and `LastTime` members are of type `ErrTimeType`, this struct can also be found in the document:  
 ![](docs/definitionErrTimeType.png)
 
 Together with the knowledge that the array always contains 25 items it is now possible to parse the response command using a `CoLaParameterReader`:

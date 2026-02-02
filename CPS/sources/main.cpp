@@ -122,6 +122,8 @@
 #include "GlobalVar.h"
 #include "DataStack.h"
 
+#include "CPS.h"
+
 #pragma comment(lib, "Dbghelp.lib")
 #include <DbgHelp.h>
 
@@ -136,7 +138,7 @@ namespace fs = std::filesystem;
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.3";
+const std::string program_version = "1.4";
 
 struct bbx
 {
@@ -248,6 +250,8 @@ std::mutex mutex_cps[6]{};
 std::condition_variable cond_cps[6]{};
 std::atomic<bool> cps_running[6]{ true, true, true, true, true, true };
 bool cps_flag[6]{ false, false, false, false, false, false  };
+
+CPS chassisDetector[6];
 
 std::string saveName;
 std::string saveDirName;
@@ -1648,6 +1652,19 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr makePCL_PointCloud(std::vector<visionary::Po
 		return NULL;
 	}
 }
+pcl::PointCloud<pcl::PointXYZ>::Ptr savePointCloudInMeters(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input) {
+	// Create a copy of the cloud
+	pcl::PointCloud<pcl::PointXYZ>::Ptr cloudInMeters(new pcl::PointCloud<pcl::PointXYZ>(*input));
+
+	// Convert mm to m (divide by 1000)
+	for (auto& point : cloudInMeters->points) {
+		point.x /= 1000.0f;
+		point.y /= 1000.0f;
+		point.z /= 1000.0f;
+	}
+
+	return cloudInMeters;
+}
 
 //for early logging files 
 pcl::PointCloud<pcl::PointXYZ>::Ptr makePCL_PointCloud(pcl::PointCloud<pcl::PointXYZ> input, bool convert = false)
@@ -1887,6 +1904,687 @@ void clear_proc_status(int procNum)
 	CPS_Lane_Enabled[i] = false;
 	
 	logMessage("CPS - Proc: " + std::to_string(procNum) + " Status Cleared");
+}
+
+using Clock = std::chrono::steady_clock;
+
+struct CPSFrameResult { //샤시 2대 일 떄 동시 판단을 위해서 2개까지 ..
+	std::vector<int>         clusterCounts;   // up to 2 clusters (point counts) 
+	std::vector<cv::Point3f> tailPoints;      // up to 2 tailpoints (nearest first)
+	long long                processing_ms = 0;
+};
+
+static constexpr float VOX_MM = 5.0f;
+static constexpr int   SOR_K = 30;
+static constexpr float SOR_STD = 1.0f;        // previously 1.5
+
+static constexpr float CLUSTER_TOL = 120.0f;  // previously 60
+static constexpr int   MIN_PTS = 30;      // previously 50
+
+// ==================== Filtering / Denoising ====================
+pcl::PointCloud<pcl::PointXYZ>::Ptr removeNoise(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr& inputCloud,
+	float x_min, float x_max,
+	float y_min, float y_max,
+	float z_min, float z_max,
+	const std::string& debug_filename)
+{
+	if (!inputCloud || inputCloud->empty())
+		return std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+
+	auto cloud = pcl::PointCloud<pcl::PointXYZ>::Ptr(
+		new pcl::PointCloud<pcl::PointXYZ>(*inputCloud));
+
+	pcl::PassThrough<pcl::PointXYZ> pass;
+
+	pass.setInputCloud(cloud); pass.setFilterFieldName("x");
+	pass.setFilterLimits(x_min, x_max); pass.filter(*cloud);
+
+	pass.setInputCloud(cloud); pass.setFilterFieldName("y");
+	pass.setFilterLimits(y_min, y_max); pass.filter(*cloud);
+
+	pass.setInputCloud(cloud); pass.setFilterFieldName("z");
+	pass.setFilterLimits(z_min, z_max); pass.filter(*cloud);
+
+	// Voxel downsample
+	{
+		pcl::VoxelGrid<pcl::PointXYZ> vox; vox.setInputCloud(cloud);
+		vox.setLeafSize(VOX_MM, VOX_MM, VOX_MM); vox.filter(*cloud);
+	}
+	// Statistical outlier removal
+	{
+		pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+		sor.setInputCloud(cloud);
+		sor.setMeanK(SOR_K);
+		sor.setStddevMulThresh(SOR_STD);
+		sor.filter(*cloud);
+	}
+
+	if (!debug_filename.empty())
+		pcl::io::savePCDFileBinaryCompressed(debug_filename, *cloud);
+
+	return cloud;
+}
+
+// ==================== Tailpoint from clusters ====================
+static cv::Point3f tailFromCluster_ZPercentile_YMeanNearest(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr& cluster,
+	float percentile = 0.05f,
+	const std::string& debug_slice_filename = "")
+{
+	if (!cluster || cluster->empty()) return { -9999, -9999, -9999 };
+
+	std::vector<float> zs; zs.reserve(cluster->size());
+	for (const auto& p : cluster->points) zs.push_back(p.z);
+
+	size_t k = (size_t)std::clamp((int)std::floor(zs.size() * percentile), 0, (int)zs.size() - 1);
+	std::nth_element(zs.begin(), zs.begin() + k, zs.end());
+	float z_thresh = zs[k];
+
+	auto sliced = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>());
+	sliced->reserve(cluster->size());
+	for (const auto& p : cluster->points) if (p.z <= z_thresh) sliced->push_back(p);
+
+	if (sliced->empty()) return { -9999, -9999, -9999 };
+	if (!debug_slice_filename.empty())
+		pcl::io::savePCDFileBinaryCompressed(debug_slice_filename, *sliced);
+
+	float my = 0.f; for (const auto& p : sliced->points) my += p.y; my /= sliced->size();
+
+	float best = 1e9f; pcl::PointXYZ bp;
+	for (const auto& p : sliced->points) {
+		float d = std::fabs(p.y - my);
+		if (d < best) { best = d; bp = p; }
+	}
+	return { bp.x, bp.y, bp.z };
+}
+
+std::vector<cv::Point3f> detectChassisTailCenters(
+	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
+	float cluster_tolerance_mm,
+	int min_points,
+	float z_slice_percent,
+	const std::string& debug_base,
+	std::vector<int>* cluster_counts)
+{
+	std::vector<cv::Point3f> results;
+	if (cluster_counts) cluster_counts->clear();
+	if (!cloud || cloud->empty()) return results;
+
+	// Euclidean clustering
+	pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+	tree->setInputCloud(cloud);
+
+	std::vector<pcl::PointIndices> clusters_idx;
+	pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+	ec.setClusterTolerance(cluster_tolerance_mm);
+	ec.setMinClusterSize(min_points);
+	ec.setMaxClusterSize(250000);
+	ec.setSearchMethod(tree);
+	ec.setInputCloud(cloud);
+	ec.extract(clusters_idx);
+
+	if (clusters_idx.empty()) return results;
+
+	struct CI { int n; pcl::PointIndices idx; };
+	std::vector<CI> cs; cs.reserve(clusters_idx.size());
+	for (auto& id : clusters_idx) cs.push_back({ (int)id.indices.size(), id });
+	std::sort(cs.begin(), cs.end(), [](const CI& a, const CI& b) { return a.n > b.n; });
+	if (cs.size() > 2) cs.resize(2);
+
+	std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters;
+	clusters.reserve(cs.size());
+	for (size_t i = 0; i < cs.size(); ++i) {
+		auto cl = pcl::PointCloud<pcl::PointXYZ>::Ptr(new pcl::PointCloud<pcl::PointXYZ>());
+		cl->reserve(cs[i].n);
+		for (int id : cs[i].idx.indices) cl->push_back(cloud->points[(size_t)id]);
+		if (cluster_counts) cluster_counts->push_back((int)cl->size());
+		clusters.push_back(cl);
+		if (!debug_base.empty())
+			pcl::io::savePCDFileBinaryCompressed(debug_base + "_cluster" + std::to_string(i) + ".pcd", *cl);
+	}
+
+	for (size_t i = 0; i < clusters.size(); ++i) {
+		auto tail = tailFromCluster_ZPercentile_YMeanNearest(
+			clusters[i], std::clamp(z_slice_percent, 0.01f, 0.20f),
+			debug_base.empty() ? "" : (debug_base + "_cluster" + std::to_string(i) + "_zsliced.pcd"));
+		if (tail.z > -9000.f) results.push_back(tail);
+	}
+
+	// Nearer first
+	std::sort(results.begin(), results.end(), [](const auto& a, const auto& b) { return a.z < b.z; });
+	if (results.size() > 2) results.resize(2);
+	return results;
+}
+
+CPSFrameResult processCPSFrame(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr& rawCloud,
+	const bool LeftSide,
+	const std::string& baseDir,
+	const std::string& frameName,
+	bool save)
+{
+	auto t0 = Clock::now();
+	CPSFrameResult result;
+	result.clusterCounts = { 0,0 };
+
+	// ---- Tunables (relaxed for robustness) ----
+	float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
+	float ROI_Y_Min = -1500.f, ROI_Y_Max = -1000.f;
+	float ROI_Z_Min = 1500.f, ROI_Z_Max = 5000.f;
+
+	if (LeftSide) { ROI_X_Max = -800.f; }
+	else { ROI_X_Min = 800.f; }
+
+	if (!rawCloud || rawCloud->empty()) {
+		result.processing_ms = 0;
+		return result;
+	}
+
+	// --- 0) Auto unit scaling
+	pcl::PointCloud<pcl::PointXYZ>::Ptr src(new pcl::PointCloud<pcl::PointXYZ>());
+	src->reserve(rawCloud->size());
+	float zmin = 1e9f, zmax = -1e9f;
+	for (const auto& p : rawCloud->points) { zmin = std::min(zmin, p.z); zmax = std::max(zmax, p.z); }
+	const float scale = (zmax < 50.f ? 1000.f : 1.f); // threshold 50 is safe (in mm it's always >>50)
+	for (const auto& p : rawCloud->points) src->push_back(pcl::PointXYZ(p.x * scale, p.y * scale, p.z * scale));
+
+	// --- 1) ROI + denoise
+	std::string debugFiltered = (save && !baseDir.empty() && !frameName.empty())
+		? (baseDir + "/" + frameName + "_filtered.pcd") : "";
+	auto filtered = removeNoise(src, ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, debugFiltered);
+
+	// --- 2) Cluster & tail detection
+	std::string debugBase = (save && !baseDir.empty() && !frameName.empty())
+		? (baseDir + "/" + frameName) : "";
+	auto tails = detectChassisTailCenters(filtered, CLUSTER_TOL, MIN_PTS, 0.05f, debugBase, &result.clusterCounts);
+
+	// --- 3) Fallback...  if detection fails, return at least min-Z point from filtered cloud (avoid Z=-1)
+	if (tails.empty() && filtered && !filtered->empty()) {
+		float bestZ = 1e9f; pcl::PointXYZ bestP;
+		for (const auto& q : filtered->points) { if (q.z < bestZ) { bestZ = q.z; bestP = q; } }
+		tails.push_back(cv::Point3f(bestP.x, bestP.y, bestP.z));
+	}
+
+	// Nearer first, cap to 2
+	std::sort(tails.begin(), tails.end(), [](const auto& a, const auto& b) { return a.z < b.z; });
+	if (tails.size() > 2) tails.resize(2);
+	result.tailPoints = tails;
+
+	result.processing_ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+
+	return result;
+}
+
+struct DistScore2 {
+	float score = 0.f;       // higher = better distribution
+	float coverage = 0.f;    // occ_total / total_cells
+	float inner_ratio = 0.f; // occ_inner / occ_total
+	int occ_total = 0;
+	int occ_inner = 0;
+	std::size_t n = 0;
+};
+
+static inline int popcount_u64(uint64_t x) {
+#if defined(_MSC_VER)
+	return (int)__popcnt64(x);
+#elif defined(__GNUC__) || defined(__clang__)
+	return __builtin_popcountll(x);
+#else
+	int c = 0; while (x) { x &= (x - 1); ++c; } return c;
+#endif
+}
+
+inline DistScore2 distributeness_innerfill_fast(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+	int nx = 32,
+	int ny = 32,
+	int border = 1,              // 1-cell border ring (try 1 or 2)
+	std::size_t n_min = 50
+) {
+	DistScore2 out;
+	if (!cloud) return out;
+	out.n = cloud->size();
+	if (out.n < n_min) return out;
+	if (nx < 4 || ny < 4) return out;
+	border = std::max(1, std::min(border, std::min(nx, ny) / 4));
+
+	// Pass 1: bbox
+	float xmin = std::numeric_limits<float>::infinity();
+	float xmax = -xmin;
+	float ymin = xmin;
+	float ymax = -xmin;
+	for (const auto& p : cloud->points) {
+		xmin = std::min(xmin, p.x); xmax = std::max(xmax, p.x);
+		ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y);
+	}
+	const float dx = xmax - xmin;
+	const float dy = ymax - ymin;
+	if (!(dx > 1e-9f) || !(dy > 1e-9f)) return out;
+
+	const float sx = nx / dx;
+	const float sy = ny / dy;
+
+	const int cells = nx * ny;
+	const int words = (cells + 63) / 64;
+
+	thread_local std::vector<uint64_t> bits;
+	if ((int)bits.size() != words) bits.assign(words, 0ULL);
+	else std::fill(bits.begin(), bits.end(), 0ULL);
+
+	// Pass 2: set occupancy bit
+	for (const auto& p : cloud->points) {
+		int ix = (int)((p.x - xmin) * sx);
+		int iy = (int)((p.y - ymin) * sy);
+		if (ix < 0) ix = 0; else if (ix >= nx) ix = nx - 1;
+		if (iy < 0) iy = 0; else if (iy >= ny) iy = ny - 1;
+
+		const int cell = iy * nx + ix;
+		bits[cell >> 6] |= (1ULL << (cell & 63));
+	}
+
+	// Count total occupied cells (popcount)
+	int occ_total = 0;
+	for (uint64_t w : bits) occ_total += popcount_u64(w);
+	out.occ_total = occ_total;
+	if (occ_total == 0) return out;
+
+	// Count occupied inner cells (exclude border ring) — fast scan by cell
+	int occ_inner = 0;
+	const int ix0 = border, ix1 = nx - border;
+	const int iy0 = border, iy1 = ny - border;
+
+	for (int iy = iy0; iy < iy1; ++iy) {
+		int base = iy * nx;
+		for (int ix = ix0; ix < ix1; ++ix) {
+			int cell = base + ix;
+			uint64_t mask = (1ULL << (cell & 63));
+			if (bits[cell >> 6] & mask) occ_inner++;
+		}
+	}
+	out.occ_inner = occ_inner;
+
+	out.coverage = (float)occ_total / (float)cells;
+	out.inner_ratio = (float)occ_inner / (float)occ_total;
+
+	// Final score: spread out + filled interior
+	out.score = out.coverage * out.inner_ratio;
+	return out;
+}
+
+struct ChassisTailState {
+	bool has_last = false;
+	Eigen::Vector3f last_xyz = Eigen::Vector3f::Zero();
+};
+// In-place quantile using nth_element (O(n))
+static inline float quantile_inplace(std::vector<float>& v, float q) {
+	if (v.empty()) return std::numeric_limits<float>::quiet_NaN();
+	q = std::clamp(q, 0.0f, 1.0f);
+	const size_t k = static_cast<size_t>(std::llround(q * (v.size() - 1)));
+	std::nth_element(v.begin(), v.begin() + k, v.end());
+	return v[k];
+}
+
+// Returns true if valid output; if invalid, returns false and keeps output unchanged.
+inline bool estimateChassisTailXYZ(
+	const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud_in,
+	Eigen::Vector3f& chassis_xyz_out,
+	ChassisTailState& state,
+	// ROI (meters)
+	Eigen::Vector4f& roi_min = Eigen::Vector4f(-1500.f, -1500.f, 1000.f, 1.f),
+	Eigen::Vector4f& roi_max = Eigen::Vector4f(-850.f, 0.f, 4000.f, 1.f),
+	// Performance/robustness parameters
+	float voxel_leaf = 30.f,             // 30 mm
+	float cluster_tolerance = 100.f,       // 80 mm
+	int cluster_min_size = 120,
+	float z_low_quantile = 0.15f,          // 8th percentile
+	float z_slice_thickness = 150.f,       // 150 mm slice after zq
+	// Temporal stability
+	float max_step = 50.f,                // 50 mm clamp
+	float ema_alpha = 0.35f,               // smoothing
+	float reject_jump = 300.f              // if jump > 300mm, ignore measurement
+) {
+	if (!cloud_in || cloud_in->empty()) return false;
+
+	// 1) ROI crop
+	pcl::PointCloud<pcl::PointXYZ>::Ptr roi(new pcl::PointCloud<pcl::PointXYZ>);
+	pcl::CropBox<pcl::PointXYZ> crop;
+	crop.setMin(roi_min);
+	crop.setMax(roi_max);
+	crop.setInputCloud(cloud_in);
+	crop.filter(*roi);
+
+	if (static_cast<int>(roi->size()) < cluster_min_size) return false;
+
+	// 2) Voxel downsample
+	pcl::PointCloud<pcl::PointXYZ>::Ptr ds(new pcl::PointCloud<pcl::PointXYZ>);
+	pcl::VoxelGrid<pcl::PointXYZ> vg;
+	vg.setLeafSize(voxel_leaf, voxel_leaf, voxel_leaf);
+	vg.setInputCloud(roi);
+	vg.filter(*ds);
+
+	if (static_cast<int>(ds->size()) < cluster_min_size) return false;
+
+	// 3) Clustering (largest cluster in ROI)
+	pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+	tree->setInputCloud(ds);
+
+	std::vector<pcl::PointIndices> clusters;
+	pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+	ec.setSearchMethod(tree);
+	ec.setInputCloud(ds);
+	ec.setClusterTolerance(cluster_tolerance);
+	ec.setMinClusterSize(cluster_min_size);
+	ec.setMaxClusterSize(200000);
+	ec.extract(clusters);
+
+	if (clusters.empty()) return false;
+
+	const pcl::PointIndices* best = &clusters[0];
+	for (const auto& c : clusters) {
+		if (c.indices.size() > best->indices.size()) best = &c;
+	}
+
+	// 4) Robust Z as low quantile within best cluster
+	std::vector<float> zs;
+	zs.reserve(best->indices.size());
+	for (int idx : best->indices) zs.push_back(ds->points[idx].z);
+
+	const float zq = quantile_inplace(zs, z_low_quantile);
+	if (!std::isfinite(zq)) return false;
+
+	// 5) X/Y from slice [zq, zq + thickness], use median for stability
+	const float z_hi = zq + z_slice_thickness;
+	std::vector<float> xs; xs.reserve(best->indices.size());
+	std::vector<float> ys; ys.reserve(best->indices.size());
+
+	for (int idx : best->indices) {
+		const auto& pt = ds->points[idx];
+		if (pt.z >= zq && pt.z <= z_hi) {
+			xs.push_back(pt.x);
+			ys.push_back(pt.y);
+		}
+	}
+
+	// If slice too sparse, fallback to full cluster medians
+	if (xs.size() < 30) {
+		xs.clear(); ys.clear();
+		xs.reserve(best->indices.size());
+		ys.reserve(best->indices.size());
+		for (int idx : best->indices) {
+			const auto& pt = ds->points[idx];
+			xs.push_back(pt.x);
+			ys.push_back(pt.y);
+		}
+	}
+
+	const float x_med = quantile_inplace(xs, 0.50f);
+	const float y_med = quantile_inplace(ys, 0.50f);
+	if (!std::isfinite(x_med) || !std::isfinite(y_med)) return false;
+
+	Eigen::Vector3f meas(x_med, y_med, zq);
+
+	// 6) Temporal stabilization (reject big jump, clamp to 50mm, EMA)
+	Eigen::Vector3f out = meas;
+	if (state.has_last) {
+		const Eigen::Vector3f last = state.last_xyz;
+		Eigen::Vector3f delta = meas - last;
+		const float jump = delta.norm();
+
+		// reject unreasonable association (wrong blob/noise)
+		if (jump > reject_jump) {
+			out = last; // hold
+		}
+		else {
+			// clamp movement per frame to max_step (vector clamp)
+			const float d = delta.norm();
+			if (d > max_step && d > 1e-6f) {
+				delta *= (max_step / d);
+			}
+			const Eigen::Vector3f clamped = last + delta;
+
+			// EMA smoothing
+			const float a = std::clamp(ema_alpha, 0.0f, 1.0f);
+			out = (1.0f - a) * last + a * clamped;
+		}
+	}
+
+	chassis_xyz_out = out;
+	state.last_xyz = out;
+	state.has_last = true;
+	return true;
+}
+
+int CPS_ProcessFrame2(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool isLeftSensor, pcl::PointXYZ& refChassisPosition, std::string savePath = std::string(""), int LaneNumber = 0)
+{
+	Eigen::Vector4f roi_min = Eigen::Vector4f(-1500.f, -1500.f, 1000.f, 1.f);
+	Eigen::Vector4f roi_max = Eigen::Vector4f(-850.f, 0.f, 4000.f, 1.f);
+	if (!isLeftSensor)
+	{
+		roi_min = Eigen::Vector4f(850.f, -1500.f, 1000.f, 1.f);
+		roi_max = Eigen::Vector4f(1500.f, 0.f, 4000.f, 1.f);
+	}
+
+	ChassisTailState tail_state;      // must persist between frames
+	Eigen::Vector3f chassis_xyz_mm;   // output (mm)
+	bool valid = estimateChassisTailXYZ(input, chassis_xyz_mm, tail_state, roi_min, roi_max);
+	if (valid)
+	{
+		refChassisPosition = pcl::PointXYZ(tail_state.last_xyz.x(), tail_state.last_xyz.y(), tail_state.last_xyz.z());
+
+		if (savePath != std::string(""))
+		{
+			pcl::PointCloud<pcl::PointXYZ>::Ptr cpos(new pcl::PointCloud<pcl::PointXYZ>);
+			cpos->points.push_back(refChassisPosition);
+
+			if (cpos->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_chassis_position.pcd", *cpos);
+		}
+
+		return chassis_xyz_mm.z();
+	}
+	else
+	{
+		if (tail_state.has_last) return tail_state.last_xyz.z();
+		else return 10000;
+	}
+}
+
+int CPS_ProcessFrame_Rev(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool isLeftSensor, pcl::PointXYZ& refChassisPosition, std::string savePath = std::string(""), int LaneNumber = 0)
+{
+	// ---- Tunables (relaxed for robustness) ----
+	float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
+	float ROI_Y_Min = -1500.f, ROI_Y_Max = 0.f;
+	//2026.01.09 - CPS Min Z from 2200 to 2000. -> 2m까지도 안쪽으로 들어오는 경우.
+
+	float ROI_Z_Min = 1000.f, ROI_Z_Max = 4000.f;
+
+	if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
+	else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
+
+	float VOX_MM = 30.0f;
+	int   SOR_K = 30;
+	float SOR_STD = 1.0f;        // previously 1.5
+
+	//SLICE_SCORE
+	float SCORE_MIN = 0.15;
+	float COVERAGE_MIN = 0.18;
+	float INNER_RAIO_MIN = 0.80;
+	int CONSEC_K = 2;
+
+	float RW_THRESHOLD = 0.7;
+	float RH_THRESHOLD = 0.7;
+
+	int pcThreshold = 200;
+
+	int ChassisPosition = 10000;
+	//pcl::PointXYZ refChassisPosition;
+
+	try
+	{
+		//Logic
+		//1. PassThrough Filter (ROI)
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pass_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		pc_passThrough(input, ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, pass_filtered);
+
+		if (savePath != std::string(""))
+			if (pass_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_passThrough.pcd", *pass_filtered);
+
+		//2. Voxel DownSample
+		pcl::PointCloud<pcl::PointXYZ>::Ptr voxel_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		//auto v_time = std::chrono::high_resolution_clock::now();
+		pc_VoxelDown(pass_filtered, VOX_MM, VOX_MM, VOX_MM, voxel_filtered);
+		//logMessage("Voxel Time: " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - v_time).count()) + "ms");
+
+		if (savePath != std::string(""))
+			if (voxel_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_voxelFiltered.pcd", *voxel_filtered);
+
+		//3. Statistical Outlier Removal	
+		pcl::PointCloud<pcl::PointXYZ>::Ptr sor_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		//auto sor_time = std::chrono::high_resolution_clock::now();
+		pc_NoiseFilter(voxel_filtered, SOR_K, SOR_STD, sor_filtered);
+		//logMessage("SOR Time: " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - sor_time).count()) + "ms");
+
+		if (savePath != std::string(""))
+			if (sor_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_sorFiltered.pcd", *sor_filtered);
+		
+
+		int baseMinZ, baseMaxZ;
+		int baseMinX, baseMaxX;
+		int baseMinY, baseMaxY;
+
+		//auto coc_time = std::chrono::high_resolution_clock::now();
+		get_center_of_cloud(*sor_filtered, ref(baseMaxX), ref(baseMinX), ref(baseMaxY), ref(baseMinY), ref(baseMaxZ), ref(baseMinZ));
+		//logMessage("getCenter Time: " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - coc_time).count()) + "ms");
+
+		//2026.01.06 Added -- use only top 2/3 of the cluster.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pass_filtered_y(new pcl::PointCloud<pcl::PointXYZ>);
+		float sMaxY = (float)baseMaxY;
+		float sMinY = sMaxY - (sMaxY - (float)baseMinY) * 3 / 4;
+		//logMessage("y slice: " + std::to_string(sMinY) + "," + std::to_string(sMaxY));
+		pc_passThrough(sor_filtered, sMinY, sMaxY, "y", pass_filtered_y);
+
+		if (savePath != std::string(""))
+			if (pass_filtered_y->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_passThrough_on_y.pcd", *pass_filtered_y);
+
+		//Re calc base.
+		get_center_of_cloud(*pass_filtered_y, ref(baseMaxX), ref(baseMinX), ref(baseMaxY), ref(baseMinY), ref(baseMaxZ), ref(baseMinZ));
+
+		int baseWidth = abs(baseMaxX - baseMinX);
+		int baseHeight = abs(baseMaxY - baseMinY);
+
+		//4. Slice from minZ to maxZ in 50mm slices to get valid tailEnd of the chassis.
+		int minZ, maxZ;
+		minZ = get_valid_min_z(pass_filtered_y);
+		//get_max_min_z(sor_filtered, ref(maxZ), ref(minZ));
+		int slice_step = 50;
+
+		int valid_score_slice_count = 0;
+
+		int selected_i = -1;
+
+		int maxPC_slice = 0;
+
+		//Backup.
+		int maxPC_iter = -1;
+		int maxPC = 0;
+		float maxScore = 0;
+		int maxScore_iter = -1;
+
+		pcl::PointCloud<pcl::PointXYZ>::Ptr maxScoreslice(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr maxPCslice(new pcl::PointCloud<pcl::PointXYZ>);
+
+		bool minPC_condition = false;
+		int minPC_i = -1;
+		int stop_i = -1;
+
+		pcl::PointCloud<pcl::PointXYZ>::Ptr basePCslice(new pcl::PointCloud<pcl::PointXYZ>);
+		int basePC_i = -1;
+
+		//minZ to 300mm (10 slices?)
+		for (int i = 0; i < 10; i++)
+		{
+			if (minPC_condition)
+			{
+				if (i > stop_i) break;
+			}
+
+			//instead of 50mm increments, go through 25mm increments but looking at 50mm slice width. 
+			pcl::PointCloud<pcl::PointXYZ>::Ptr slice(new pcl::PointCloud<pcl::PointXYZ>);
+			int minimumZ = minZ + i * slice_step / 2;
+			int maximumZ = minimumZ + slice_step;
+			pc_passThrough(pass_filtered_y, minimumZ, maximumZ, "z", slice);
+
+			int refMinZ, refMaxZ;
+			int refMinX, refMaxX;
+			int refMinY, refMaxY;
+			get_center_of_cloud(*slice, ref(refMaxX), ref(refMinX), ref(refMaxY), ref(refMinY), ref(refMaxZ), ref(refMinZ));
+			int refWidth = abs(refMaxX - refMinX);
+			int refHeight = abs(refMaxY - refMinY);
+
+			float ratioW = float(refWidth) / float(baseWidth);
+			float ratioH = float(refHeight) / float(baseHeight);
+
+			bool accounted_for = false;
+
+			if (slice->points.size() > 0)
+			{
+				if (basePC_i == -1)
+				{
+					basePC_i = i;
+					pcl::copyPointCloud(*slice, *basePCslice);
+					continue;
+				}
+				else
+				{
+					if (slice->points.size() >= basePCslice->points.size() * 1.5)
+					{
+						basePC_i = i;
+						pcl::copyPointCloud(*slice, *basePCslice);
+						continue;
+					}
+				}
+			}
+		}
+
+		if (basePCslice->points.size() > 100)
+		{
+			if (savePath != std::string(""))
+			{
+				pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_selected_slice_z_i_" + std::to_string(basePC_i) + "pc_" + std::to_string(basePCslice->points.size()) + ".pcd", *basePCslice);
+			}
+
+			int refMinZ, refMaxZ;
+			int refMinX, refMaxX;
+			int refMinY, refMaxY;
+			get_center_of_cloud(*basePCslice, ref(refMaxX), ref(refMinX), ref(refMaxY), ref(refMinY), ref(refMaxZ), ref(refMinZ));
+
+			get_max_min_z(basePCslice, refMaxZ, refMinZ);
+
+			ChassisPosition = refMinZ;
+			refChassisPosition = pcl::PointXYZ((refMaxX + refMinX) / 2, (refMaxY + refMinY) / 2, refMinZ);
+
+			if (savePath != std::string(""))
+			{
+				pcl::PointCloud<pcl::PointXYZ>::Ptr cpos(new pcl::PointCloud<pcl::PointXYZ>);
+				cpos->points.push_back(refChassisPosition);
+
+				if (cpos->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_chassis_position.pcd", *cpos);
+			}
+		}
+
+		return ChassisPosition;
+
+	}
+	catch (std::exception& ex)
+	{
+		logMessage("[CPS_ProcessFrame] " + std::string(ex.what()));
+		return -1;
+	}
+	catch (...)
+	{
+		logMessage("[CPS_ProcessFrame] Unknown Exception!");
+		return -1;
+	}
 }
 
 int CPS_ProcessFrame(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool isLeftSensor, pcl::PointXYZ& refChassisPosition, std::string savePath = std::string(""), int LaneNumber = 0)
@@ -2142,6 +2840,50 @@ int CPS_ProcessFrame(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool isLeftSenso
 	}
 }
 
+//2026.02.02 CPS Logic Updates
+int CPS_ProcessFrame_20260202(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool isLeftSensor, pcl::PointXYZ& refChassisPosition, std::string savePath = std::string(""), int LaneNumber = 0)
+{
+	// ---- Tunables (relaxed for robustness) ----
+	float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
+	float ROI_Y_Min = -1500.f, ROI_Y_Max = 0.f;
+	//2026.01.09 - CPS Min Z from 2200 to 2000. -> 2m까지도 안쪽으로 들어오는 경우.
+
+	float ROI_Z_Min = 1000.f, ROI_Z_Max = 4000.f;
+
+	if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
+	else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
+
+	if (savePath != std::string(""))
+	{
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pass_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		pc_passThrough(input, ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, pass_filtered);
+
+		if (pass_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_roi.pcd", *pass_filtered);
+	}
+
+	//Setting detector parameters.
+	//chassisDetector[LaneNumber - 1].setParams(ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, 5, 200.f);
+
+	float chassisDistance = chassisDetector[LaneNumber - 1].detectChassisDistance(input);
+
+	if (savePath != std::string(""))
+	{
+		pcl::PointCloud<pcl::PointXYZ>::Ptr cpos(new pcl::PointCloud<pcl::PointXYZ>);
+		refChassisPosition.x = ROI_X_Min + (ROI_X_Max - ROI_X_Min) / 2;
+		refChassisPosition.y = ROI_Y_Min + (ROI_Y_Max - ROI_Y_Min) / 2;
+		refChassisPosition.z = chassisDistance;
+		cpos->points.push_back(refChassisPosition);
+
+		if (cpos->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_chassis_position.pcd", *cpos);
+	}
+
+	if (chassisDistance == -1) chassisDistance = 10000;
+
+	return chassisDistance;
+}
+
+
+
 //CPS Thread
 void CPS_Processing_Thread(int LaneNumber)
 {
@@ -2276,6 +3018,21 @@ void CPS_Processing_Thread(int LaneNumber)
 
 					std::string saveFolder_fix = cpsSaveFolderName[procIndex];
 
+					// ---- Tunables (relaxed for robustness) ----
+					float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
+					float ROI_Y_Min = -1500.f, ROI_Y_Max = 0.f;
+					//2026.01.09 - CPS Min Z from 2200 to 2000. -> 2m까지도 안쪽으로 들어오는 경우.
+
+					float ROI_Z_Min = 1000.f, ROI_Z_Max = 4000.f;
+
+					if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
+					else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
+
+					//Setup detector here.
+					chassisDetector[procIndex].setParams(ROI_X_Max, ROI_X_Min, ROI_Y_Max, ROI_Y_Min, ROI_Z_Max, ROI_Z_Min, 5, 200.f);
+
+					auto lastSaveData = std::chrono::system_clock::now();
+
 					while (true)
 					{
 						if (!CPS_Lane_Enable[procIndex]) break;
@@ -2307,9 +3064,9 @@ void CPS_Processing_Thread(int LaneNumber)
 							break;
 						}
 
-						auto lastSaveData = std::chrono::system_clock::now();
+						
 						auto waitDur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - last_frame_get_time).count();
-						if (waitDur_ms > 100)
+						if (waitDur_ms > 150)
 						{
 							bool stepComplete = visionaryControl[procIndex].stepAcquisition();
 							if (stepComplete)
@@ -2343,20 +3100,10 @@ void CPS_Processing_Thread(int LaneNumber)
 											logMessage("[TMini-Data-Stream] Failed to create PCL Point Cloud from data handler. -- nullptr!");
 											continue;
 										}
+										//auto savePointCloud = savePointCloudInMeters(pclPointCloud);
 
-										/*
-										CPSFrameResult cpsFrameResult;
-										cpsFrameResult = processCPSFrame(pclPointCloud, isLeftSensor, std::string(""), std::string(""), false);
-
-										int chassisPos = 10000;
-										if (cpsFrameResult.tailPoints.size() > 0)
-										{
-											chassisPos = cpsFrameResult.tailPoints.at(0).z;
-										}
-										*/
-										//grayToClr, pclPointCloud.
 										pcl::PointXYZ refChassisPosition(0, 0, 0);
-										int chassisPos = CPS_ProcessFrame_Rev(pclPointCloud, isLeftSensor, refChassisPosition, std::string(""), LaneNumber);
+										int chassisPos = CPS_ProcessFrame_20260202(pclPointCloud, isLeftSensor, refChassisPosition, std::string(""), LaneNumber);
 										
 										/*
 										auto temp = chassisPos - TARGET_STOP_POSITION_MM;
@@ -2419,7 +3166,9 @@ void CPS_Processing_Thread(int LaneNumber)
 										
 										if (ENABLE_SAVE_ALL)
 										{
-											if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - lastSaveData).count() > 2000)
+											auto durCast = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - lastSaveData).count();
+											//logMessage("Delta Time: " + std::to_string(durCast));
+											if (durCast > 2000)
 											{
 												saveEnable = true;
 												lastSaveData = std::chrono::system_clock::now();
@@ -2514,6 +3263,8 @@ void CPS_Processing_Thread(int LaneNumber)
 											//Push to save queue.
 											auto dataTup = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, bool, int, std::string, std::chrono::system_clock::time_point>(grayToClr, *pclPointCloud, isLeftSensor, procIndex, saveFolder_fix, last_frame_get_time);
 											tsq.push(dataTup);
+
+											//logMessage("Saving to push?");
 										}
 
 										//For Checking.
@@ -2588,6 +3339,38 @@ void CPS_Processing_Thread(int LaneNumber)
 	}
 }
 
+void clear_proc_status()
+{
+	for (int i = 0; i < 6; i++)
+	{
+		cps_flag[i] = false;
+
+		isAssigned[i] = false;
+		//assignedLaneNumber[i] = -1;
+		
+		isAvailable[i] = true;
+		isRunning[i] = false;
+		activeLaneChanged[i] = false;
+	}
+
+	while (!cps_queue.empty())
+	{
+		cps_queue.pop();
+	}
+
+	for (int i = 0; i < 6; i++)
+	{
+		assignedProcNumber[i] = -1;
+		CPS_Lane_Completed[i] = false;
+		CPS_Lane_Enable[i] = false;
+		CPS_Lane_Enabled[i] = false;
+		CPS_Lane_Fault[i] = -10000;
+		//CPS_Lane_RD[i] = -10000;
+	}
+
+	logMessage("CPS Status Cleared");
+}
+
 //CPS Debugging
 void CPS_Processing_Debug()
 {
@@ -2640,6 +3423,18 @@ void CPS_Processing_Debug()
 		}
 		
 		auto isLeftSensor = (subDirectionDir[0] == "LeftSensor") ? true : false;
+
+		// ---- Tunables (relaxed for robustness) ----
+		float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
+		float ROI_Y_Min = -1500.f, ROI_Y_Max = 0.f;
+		//2026.01.09 - CPS Min Z from 2200 to 2000. -> 2m까지도 안쪽으로 들어오는 경우.
+
+		float ROI_Z_Min = 1000.f, ROI_Z_Max = 4000.f;
+
+		if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
+		else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
+
+		chassisDetector[0].setParams(ROI_X_Max, ROI_X_Min, ROI_Y_Max, ROI_Y_Min, ROI_Z_Max, ROI_Z_Min, 5, 200.f);
 
 		//load .jpg, .pcd files for processing
 		auto image_filePath = jobDir + "/" + subDir[0] + "/" + subDirectionDir[0] + "/" + std::string("Image");
@@ -2715,12 +3510,12 @@ void CPS_Processing_Debug()
 
 			logMessage("Processing: " + filename);
 			auto pointCloud = makePCL_PointCloud(*pcData, DEBUG_CONVERT_PCL_RANGE);
-			pcl::io::savePCDFileBinaryCompressed(save_current_file_path + "/" + filename + "_base_converted.pcd", *pointCloud);
+			//pcl::io::savePCDFileBinaryCompressed(save_current_file_path + "/" + filename + "_base_converted.pcd", *pointCloud);
 
 			auto savePath = save_current_file_path + "/" + filename;
 
 			pcl::PointXYZ refChassisPosition(0, 0, 0);
-			int chassisPos = CPS_ProcessFrame_Rev(pointCloud, isLeftSensor, refChassisPosition, save_current_file_path);
+			int chassisPos = CPS_ProcessFrame_20260202(pointCloud, isLeftSensor, refChassisPosition, save_current_file_path, 1);
 
 			log_lines += std::to_string(chassisPos);// +"\n";
 
@@ -2750,38 +3545,6 @@ void CPS_Processing_Debug()
 	}
 
 
-}
-
-void clear_proc_status()
-{
-	for (int i = 0; i < 6; i++)
-	{
-		cps_flag[i] = false;
-
-		isAssigned[i] = false;
-		//assignedLaneNumber[i] = -1;
-
-		isAvailable[i] = true;
-		isRunning[i] = false;
-		activeLaneChanged[i] = false;
-	}
-
-	while (!cps_queue.empty())
-	{
-		cps_queue.pop();
-	}
-
-	for (int i = 0; i < 6; i++)
-	{
-		assignedProcNumber[i] = -1;
-		CPS_Lane_Completed[i] = false;
-		CPS_Lane_Enable[i] = false;
-		CPS_Lane_Enabled[i] = false;
-		CPS_Lane_Fault[i] = -10000;
-		//CPS_Lane_RD[i] = -10000;
-	}
-
-	logMessage("CPS Status Cleared");
 }
 
 void handleClient(SOCKET clientSocket) {

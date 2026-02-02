@@ -8,7 +8,7 @@
 
 cmake_minimum_required(VERSION 3.8)
 
-project(SampleVisionary
+project(LSTP_CPS
         VERSION 0.1.0
         LANGUAGES CXX)
 
@@ -17,7 +17,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -42,6 +42,13 @@ add_subdirectory(sick_visionary_cpp_shared)
 #target_link_libraries(SampleVisionaryTVGA sick_visionary_cpp_shared)
 
 ## Visionary-T Mini samples ##
-add_executable(SampleVisionaryTMini SampleVisionaryTMini/SampleVisionaryTMini.cpp)
-target_link_libraries(SampleVisionaryTMini sick_visionary_cpp_shared)
+add_executable(LSTP_CPS 
+  CPS/sources/main.cpp
+  CPS/sources/CPS.cpp
+  CPS/headers/CPS.h
+  CPS/headers/Config.hpp
+  CPS/headers/DataStack.h
+  CPS/headers/GlobalVar.h
+  CPS/headers/miniINI.h)
+target_link_libraries(LSTP_CPS sick_visionary_cpp_shared)
 
