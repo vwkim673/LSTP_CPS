@@ -1,8 +1,12 @@
 #pragma once
 
+#include <pcl/pcl_base.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/common/common.h>
+#include <pcl/filters/voxel_grid.h>
+
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -40,6 +44,7 @@ public:
         float maxY = std::numeric_limits<float>::max(),  // No upper limit by default
         float minZ = 500.0f,                            // Min distance (0.5 meters)
         float maxZ = 10000.0f,                          // Max distance (10 meters)
+        float voxelSize = 30.0f,
         int historySize = 5,                            // Number of frames for temporal filtering
         float maxJump = 200.0f                          // Max allowed jump between measurements
     );
@@ -118,6 +123,7 @@ public:
         float maxY,
         float minZ,
         float maxZ,
+        float voxelSize,
         int historySize,
         float maxJump
     );
@@ -129,6 +135,15 @@ public:
      */
     pcl::PointCloud<pcl::PointXYZ>::Ptr getFilteredCloud() const;
 
+    pcl::PointCloud<pcl::PointXYZ>::Ptr getFilteredCloud2() const;
+
+    /**
+     * @brief Get the voxelized point cloud from the last detection
+     *
+     * @return Voxelized point cloud
+     */
+    pcl::PointCloud<pcl::PointXYZ>::Ptr getVoxelizedCloud() const;
+
 private:
     // Configuration parameters for filtering
     float m_minX;
@@ -137,6 +152,7 @@ private:
     float m_maxY;
     float m_minZ;
     float m_maxZ;
+    float m_voxelSize;
 
     // Parameters for temporal filtering
     int m_historySize;
@@ -146,11 +162,33 @@ private:
     std::vector<float> m_distanceHistory;
     float m_lastValidDistance;
     pcl::PointCloud<pcl::PointXYZ>::Ptr m_filteredCloud;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr m_filteredCloud2; //Second-stage filter.
+    pcl::PointCloud<pcl::PointXYZ>::Ptr m_voxelizedCloud;
 
     // Constants for chassis detection
-    const int m_xBins = 10;  // Horizontal bins
-    const int m_yBins = 8;   // Vertical bins
-    const float m_consensusThreshold = 100.0f; // 100mm
-    const int m_minInliers = 3;
-    const int m_minPointsPerBin = 5;
+    const float m_sliceWidth = 100.0f; // Width of Z slices in mm
+    const int m_minPointsPerSlice = 3; // Minimum points needed for a valid slice
+    const float m_minSpatialExtent = 50.0f; // Minimum height or width for a valid chassis surface
+    const float m_minDensity = 0.00005f; // Minimum point density for a valid surface
+
+    int get_valid_min_z_binary_search(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr singlePassFilter(const pcl::PointCloud<pcl::PointXYZ>::Ptr input, float minX, float maxX, float minY, float maxY, float minZ, float maxZ);
+
+    int get_valid_min_z_fixed_buckets(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+        int minZ = 300,
+        int slice_step = 50,
+        int min_points_per_slice = 30
+    );
+
+    int get_valid_min_z_comprehensive(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+        int minZ = 300,
+        int slice_step = 50,
+        int min_points_per_slice = 30,
+        float min_x_spread = 200.0f,
+        float min_y_spread = 100.0f,
+        float min_score_threshold = 50.0f
+    );
+
 };

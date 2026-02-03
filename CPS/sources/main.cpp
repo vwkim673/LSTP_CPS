@@ -74,8 +74,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/common/common.h>
-#include <pcl/visualization/cloud_viewer.h>
-#include <pcl/visualization/pcl_visualizer.h>
+//#include <pcl/visualization/cloud_viewer.h>
+//#include <pcl/visualization/pcl_visualizer.h>
 
 #include <pcl/console/parse.h>
 #include <pcl/common/random.h>
@@ -1599,9 +1599,8 @@ auto get_valid_min_z(pcl::PointCloud<pcl::PointXYZ>::Ptr input) -> int
 
 	//at this point, just return the local min z.
 	return local_minZ;
-
-
 }
+
 auto get_max_min_z(pcl::PointCloud<pcl::PointXYZ>::Ptr input, int& maxZ, int& minZ) -> void
 {
 	int local_maxZ = -10000;
@@ -2853,6 +2852,7 @@ int CPS_ProcessFrame_20260202(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool is
 	if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
 	else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
 
+	/*
 	if (savePath != std::string(""))
 	{
 		pcl::PointCloud<pcl::PointXYZ>::Ptr pass_filtered(new pcl::PointCloud<pcl::PointXYZ>);
@@ -2860,14 +2860,28 @@ int CPS_ProcessFrame_20260202(pcl::PointCloud<pcl::PointXYZ>::Ptr input, bool is
 
 		if (pass_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_roi.pcd", *pass_filtered);
 	}
-
+	*/
 	//Setting detector parameters.
 	//chassisDetector[LaneNumber - 1].setParams(ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, 5, 200.f);
 
 	float chassisDistance = chassisDetector[LaneNumber - 1].detectChassisDistance(input);
 
+
 	if (savePath != std::string(""))
 	{
+
+		auto filteredData = chassisDetector[LaneNumber - 1].getFilteredCloud();
+		if (!filteredData->empty()) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_filtered_data.pcd", *filteredData);
+
+		auto filteredData2 = chassisDetector[LaneNumber - 1].getFilteredCloud2();
+		if (!filteredData2->empty()) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_filtered_data2.pcd", *filteredData2);
+
+
+
+		auto voxelizedData = chassisDetector[LaneNumber - 1].getVoxelizedCloud();
+		if (!voxelizedData->empty()) pcl::io::savePCDFileBinaryCompressed(savePath + "/cps_voxelized_data.pcd", *voxelizedData);
+
+
 		pcl::PointCloud<pcl::PointXYZ>::Ptr cpos(new pcl::PointCloud<pcl::PointXYZ>);
 		refChassisPosition.x = ROI_X_Min + (ROI_X_Max - ROI_X_Min) / 2;
 		refChassisPosition.y = ROI_Y_Min + (ROI_Y_Max - ROI_Y_Min) / 2;
@@ -3029,7 +3043,7 @@ void CPS_Processing_Thread(int LaneNumber)
 					else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
 
 					//Setup detector here.
-					chassisDetector[procIndex].setParams(ROI_X_Max, ROI_X_Min, ROI_Y_Max, ROI_Y_Min, ROI_Z_Max, ROI_Z_Min, 5, 200.f);
+					chassisDetector[procIndex].setParams(ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max,30.f, 5, 200.f);
 
 					auto lastSaveData = std::chrono::system_clock::now();
 
@@ -3426,7 +3440,7 @@ void CPS_Processing_Debug()
 
 		// ---- Tunables (relaxed for robustness) ----
 		float ROI_X_Min = -2000.f, ROI_X_Max = 2000.f;
-		float ROI_Y_Min = -1500.f, ROI_Y_Max = 0.f;
+		float ROI_Y_Min = -1500.f, ROI_Y_Max = -500.f;
 		//2026.01.09 - CPS Min Z from 2200 to 2000. -> 2m까지도 안쪽으로 들어오는 경우.
 
 		float ROI_Z_Min = 1000.f, ROI_Z_Max = 4000.f;
@@ -3434,7 +3448,7 @@ void CPS_Processing_Debug()
 		if (isLeftSensor) { ROI_X_Max = -900.f; ROI_X_Min = ROI_X_Max - 900; }
 		else { ROI_X_Min = 900.f; ROI_X_Max = ROI_X_Min + 900; }
 
-		chassisDetector[0].setParams(ROI_X_Max, ROI_X_Min, ROI_Y_Max, ROI_Y_Min, ROI_Z_Max, ROI_Z_Min, 5, 200.f);
+		chassisDetector[0].setParams(ROI_X_Min, ROI_X_Max, ROI_Y_Min, ROI_Y_Max, ROI_Z_Min, ROI_Z_Max, 30.f, 5, 200.f);
 
 		//load .jpg, .pcd files for processing
 		auto image_filePath = jobDir + "/" + subDir[0] + "/" + subDirectionDir[0] + "/" + std::string("Image");
@@ -3921,7 +3935,7 @@ int main(int argc, char* argv[])
 
 	SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
 
-	printf("CPS Application\n");
+	printf("LSTP CPS Application\n");
 
 	parseAppName(app_path);
 
